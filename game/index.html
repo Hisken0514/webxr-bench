@@ -1,0 +1,654 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>VR 測試場</title>
+<style>
+  body { margin: 0; background: #111; color: #eee; font-family: system-ui, sans-serif; overflow: hidden; }
+  #info { position: fixed; top: 0; left: 0; padding: 12px 16px; background: rgba(0,0,0,.7); font-size: 14px; line-height: 1.7; max-width: 420px; }
+  #info b { color: #8cf; }
+  #loading { position: fixed; inset: 0; display: flex; align-items: center; justify-content: center; font-size: 20px; background: #111; }
+  a { color: #8cf; }
+</style>
+<script type="importmap">
+{ "imports": {
+  "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+  "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/",
+  "rapier": "https://cdn.jsdelivr.net/npm/@dimforge/rapier3d-compat@0.14.0/rapier.es.js"
+} }
+</script>
+</head>
+<body>
+<div id="loading">載入物理引擎（WASM）中…</div>
+<div id="info">
+  <b>VR 測試場</b>（Three.js + Rapier WASM 物理）<br>
+  <b>左搖桿</b> 平滑移動｜<b>右搖桿左右</b> 快速轉向<br>
+  <b>右搖桿往前推</b> 瞄準傳送，放開就傳送<br>
+  <b>扳機</b> 雷射射擊標靶、按按鈕<br>
+  <b>握把</b> 抓取物件（近距離直接抓，遠距離用雷射指著會拉過來），放開即可丟出<br>
+  <b>A / X</b> 重置物件<br>
+  桌面版：WASD 移動、拖曳滑鼠轉視角、點擊射擊<br>
+  <a href="../">← 回效能測試</a>
+</div>
+
+<script type="module">
+import * as THREE from 'three';
+import { VRButton } from 'three/addons/webxr/VRButton.js';
+import { XRControllerModelFactory } from 'three/addons/webxr/XRControllerModelFactory.js';
+import { XRHandModelFactory } from 'three/addons/webxr/XRHandModelFactory.js';
+import RAPIER from 'rapier';
+
+await RAPIER.init();
+document.getElementById('loading').remove();
+
+// ================= Renderer / scene =================
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.setSize(innerWidth, innerHeight);
+renderer.xr.enabled = true;
+renderer.xr.setFoveation(1);
+document.body.appendChild(renderer.domElement);
+document.body.appendChild(VRButton.createButton(renderer));
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x87a8c8);
+scene.fog = new THREE.Fog(0x87a8c8, 15, 40);
+
+const rig = new THREE.Group();          // 玩家（移動 / 轉向都改這個）
+scene.add(rig);
+const camera = new THREE.PerspectiveCamera(70, innerWidth / innerHeight, 0.05, 100);
+camera.position.set(0, 1.6, 0);
+rig.add(camera);
+rig.position.set(0, 0, 3);
+
+scene.add(new THREE.HemisphereLight(0xffffff, 0x556644, 1.4));
+const sun = new THREE.DirectionalLight(0xffffff, 1.6);
+sun.position.set(4, 8, 3);
+scene.add(sun);
+
+addEventListener('resize', () => {
+  camera.aspect = innerWidth / innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+});
+
+// ================= Physics =================
+const world = new RAPIER.World({ x: 0, y: -9.81, z: 0 });
+const ROOM = 10;
+
+function fixedBox(w, h, d, x, y, z, color) {
+  const mesh = new THREE.Mesh(new THREE.BoxGeometry(w, h, d), new THREE.MeshLambertMaterial({ color }));
+  mesh.position.set(x, y, z);
+  scene.add(mesh);
+  const body = world.createRigidBody(RAPIER.RigidBodyDesc.fixed().setTranslation(x, y, z));
+  world.createCollider(RAPIER.ColliderDesc.cuboid(w / 2, h / 2, d / 2).setFriction(0.8), body);
+  return mesh;
+}
+
+// 地板
+const floorTex = (() => {
+  const c = document.createElement('canvas'); c.width = c.height = 256;
+  const g = c.getContext('2d');
+  g.fillStyle = '#5d7a52'; g.fillRect(0, 0, 256, 256);
+  g.fillStyle = '#668559'; g.fillRect(0, 0, 128, 128); g.fillRect(128, 128, 128, 128);
+  const t = new THREE.CanvasTexture(c);
+  t.wrapS = t.wrapT = THREE.RepeatWrapping; t.repeat.set(10, 10);
+  t.colorSpace = THREE.SRGBColorSpace;
+  return t;
+})();
+const floor = new THREE.Mesh(new THREE.PlaneGeometry(ROOM * 2, ROOM * 2), new THREE.MeshLambertMaterial({ map: floorTex }));
+floor.rotation.x = -Math.PI / 2;
+scene.add(floor);
+world.createCollider(RAPIER.ColliderDesc.cuboid(ROOM, 0.1, ROOM).setTranslation(0, -0.1, 0).setFriction(0.9));
+
+// 牆
+const wallColor = 0xd8d2c4;
+fixedBox(ROOM * 2, 3, 0.3, 0, 1.5, -ROOM, wallColor);
+fixedBox(ROOM * 2, 3, 0.3, 0, 1.5, ROOM, wallColor);
+fixedBox(0.3, 3, ROOM * 2, -ROOM, 1.5, 0, wallColor);
+fixedBox(0.3, 3, ROOM * 2, ROOM, 1.5, 0, wallColor);
+
+// 桌子
+const tables = [
+  fixedBox(1.6, 0.8, 0.8, 0, 0.4, 1.8, 0x8b5a2b),
+  fixedBox(0.8, 0.8, 1.6, -2, 0.4, 0.5, 0x8b5a2b),
+];
+// 幾個障礙
+fixedBox(1, 1, 1, 4, 0.5, -3, 0x9a8a7a);
+fixedBox(1, 2, 1, -5, 1, -5, 0x9a8a7a);
+fixedBox(3, 0.3, 3, 6, 0.15, 5, 0xa09080);
+
+// ================= Grabbable objects =================
+const grabbables = [];
+const palette = [0xe74c3c, 0x3498db, 0xf1c40f, 0x2ecc71, 0x9b59b6, 0xe67e22];
+
+function spawn(kind, x, y, z, color) {
+  let geo, colDesc, radius;
+  if (kind === 'ball') {
+    geo = new THREE.SphereGeometry(0.08, 24, 16);
+    colDesc = RAPIER.ColliderDesc.ball(0.08).setRestitution(0.7);
+    radius = 0.08;
+  } else if (kind === 'stick') {
+    geo = new THREE.BoxGeometry(0.05, 0.05, 0.45);
+    colDesc = RAPIER.ColliderDesc.cuboid(0.025, 0.025, 0.225);
+    radius = 0.2;
+  } else {
+    geo = new THREE.BoxGeometry(0.14, 0.14, 0.14);
+    colDesc = RAPIER.ColliderDesc.cuboid(0.07, 0.07, 0.07).setRestitution(0.2);
+    radius = 0.1;
+  }
+  colDesc.setFriction(0.7).setDensity(kind === 'ball' ? 400 : 600);
+  const mesh = new THREE.Mesh(geo, new THREE.MeshLambertMaterial({ color, emissive: 0x000000 }));
+  scene.add(mesh);
+  const body = world.createRigidBody(RAPIER.RigidBodyDesc.dynamic().setTranslation(x, y, z).setCcdEnabled(true));
+  world.createCollider(colDesc, body);
+  const obj = { mesh, body, radius, home: new THREE.Vector3(x, y, z), heldBy: null, kind };
+  mesh.userData.grab = obj;
+  grabbables.push(obj);
+  return obj;
+}
+
+function spawnDefaultSet() {
+  for (let i = 0; i < 4; i++) spawn('cube', -0.55 + i * 0.36, 0.9, 1.75, palette[i]);
+  for (let i = 0; i < 3; i++) spawn('ball', -0.4 + i * 0.4, 0.9, 2.0, palette[(i + 3) % 6]);
+  spawn('stick', -2, 0.9, 0.2, 0xecf0f1);
+  for (let i = 0; i < 4; i++) spawn('ball', -2, 0.9, 0.6 + i * 0.2, palette[i]);
+}
+spawnDefaultSet();
+
+function resetObjects() {
+  for (const o of grabbables) {
+    if (o.heldBy) release(o.heldBy, false);
+    world.removeRigidBody(o.body);
+    scene.remove(o.mesh);
+    o.mesh.geometry.dispose(); o.mesh.material.dispose();
+  }
+  grabbables.length = 0;
+  spawnDefaultSet();
+  score = 0;
+}
+
+// ================= Targets =================
+const targets = [];
+const targetGeo = new THREE.CylinderGeometry(0.3, 0.3, 0.06, 32);
+function makeTargetTexture() {
+  const c = document.createElement('canvas'); c.width = c.height = 128;
+  const g = c.getContext('2d');
+  ['#fff', '#e74c3c', '#fff', '#e74c3c', '#fff'].forEach((col, i) => {
+    g.fillStyle = col; g.beginPath(); g.arc(64, 64, 64 - i * 13, 0, Math.PI * 2); g.fill();
+  });
+  const t = new THREE.CanvasTexture(c); t.colorSpace = THREE.SRGBColorSpace; return t;
+}
+const targetTex = makeTargetTexture();
+for (let i = 0; i < 6; i++) {
+  const mat = [new THREE.MeshLambertMaterial({ color: 0xffffff }), new THREE.MeshLambertMaterial({ map: targetTex }), new THREE.MeshLambertMaterial({ map: targetTex })];
+  const mesh = new THREE.Mesh(targetGeo, mat);
+  mesh.rotation.x = Math.PI / 2;
+  scene.add(mesh);
+  const t = { mesh, base: new THREE.Vector3(), phase: Math.random() * 6, speed: 0.5 + Math.random(), dead: 0, moving: i >= 3 };
+  mesh.userData.target = t;
+  placeTarget(t);
+  targets.push(t);
+}
+function placeTarget(t) {
+  t.base.set((Math.random() - 0.5) * 14, 1 + Math.random() * 1.6, -ROOM + 0.3 + Math.random() * 4);
+  t.mesh.position.copy(t.base);
+  t.mesh.scale.setScalar(1);
+  t.mesh.visible = true;
+  t.dead = 0;
+}
+function hitTarget(t, src) {
+  if (t.dead) return;
+  t.dead = 0.0001;
+  score++;
+  beep(880, 0.08);
+  if (src) buzz(src, 0.8, 80);
+}
+
+// ================= 3D buttons =================
+const buttons = [];
+function labelTexture(text, bg) {
+  const c = document.createElement('canvas'); c.width = 256; c.height = 96;
+  const g = c.getContext('2d');
+  g.fillStyle = bg; g.fillRect(0, 0, 256, 96);
+  g.fillStyle = '#fff'; g.font = 'bold 40px system-ui, sans-serif';
+  g.textAlign = 'center'; g.textBaseline = 'middle'; g.fillText(text, 128, 50);
+  const t = new THREE.CanvasTexture(c); t.colorSpace = THREE.SRGBColorSpace; return t;
+}
+function makeButton(text, color, x, y, z, ry, onPress) {
+  const mesh = new THREE.Mesh(new THREE.BoxGeometry(0.4, 0.15, 0.05), [
+    ...Array(4).fill(new THREE.MeshLambertMaterial({ color })),
+    new THREE.MeshBasicMaterial({ map: labelTexture(text, '#' + color.toString(16).padStart(6, '0')) }),
+    new THREE.MeshLambertMaterial({ color }),
+  ]);
+  mesh.position.set(x, y, z);
+  mesh.rotation.y = ry;
+  scene.add(mesh);
+  const b = { mesh, onPress, pressT: 0 };
+  mesh.userData.button = b;
+  buttons.push(b);
+}
+makeButton('重置物件', 0x2c7be5, -0.5, 1.15, 1.45, 0, () => resetObjects());
+makeButton('生成方塊', 0x27ae60, 0, 1.15, 1.45, 0, () => spawn('cube', 0, 1.3, 1.8, palette[Math.floor(Math.random() * 6)]));
+makeButton('重力 開/關', 0x8e44ad, 0.5, 1.15, 1.45, 0, () => {
+  const g = world.gravity;
+  world.gravity = { x: 0, y: g.y === 0 ? -9.81 : 0, z: 0 };
+  for (const o of grabbables) o.body.wakeUp();
+});
+function pressButton(b, src) {
+  b.pressT = 0.15;
+  b.onPress();
+  beep(520, 0.06);
+  if (src) buzz(src, 0.4, 40);
+}
+
+// ================= Audio / haptics =================
+let audioCtx = null;
+function beep(freq, dur) {
+  try {
+    audioCtx ??= new AudioContext();
+    const o = audioCtx.createOscillator(), g = audioCtx.createGain();
+    o.frequency.value = freq; o.type = 'triangle';
+    g.gain.setValueAtTime(0.15, audioCtx.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + dur);
+    o.connect(g).connect(audioCtx.destination);
+    o.start(); o.stop(audioCtx.currentTime + dur);
+  } catch {}
+}
+function buzz(src, intensity, ms) {
+  const h = src?.gamepad?.hapticActuators?.[0];
+  if (h?.pulse) h.pulse(intensity, ms).catch?.(() => {});
+}
+
+// ================= Controllers =================
+const raycaster = new THREE.Raycaster();
+const tmpM = new THREE.Matrix4();
+const tmpV = new THREE.Vector3(), tmpV2 = new THREE.Vector3();
+const tmpQ = new THREE.Quaternion();
+const ctrlFactory = new XRControllerModelFactory();
+const handFactory = new XRHandModelFactory();
+const hands = [];
+
+const rayMat = new THREE.LineBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.7 });
+for (let i = 0; i < 2; i++) {
+  const ctrl = renderer.xr.getController(i);       // target ray space（雷射用）
+  const grip = renderer.xr.getControllerGrip(i);   // 握把位置（抓取用）
+  grip.add(ctrlFactory.createControllerModel(grip));
+  const hand = renderer.xr.getHand(i);
+  hand.add(handFactory.createHandModel(hand, 'mesh'));
+  rig.add(ctrl, grip, hand);
+
+  const line = new THREE.Line(new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(), new THREE.Vector3(0, 0, -1)]), rayMat);
+  line.scale.z = 5;
+  ctrl.add(line);
+  const dot = new THREE.Mesh(new THREE.SphereGeometry(0.012), new THREE.MeshBasicMaterial({ color: 0xffffff }));
+  dot.visible = false;
+  scene.add(dot);
+
+  const h = { i, ctrl, grip, line, dot, src: null, handed: '', hover: null, held: null, offset: new THREE.Matrix4(), pull: 0, vel: [], lastPos: new THREE.Vector3(), btnPrev: [], aiming: false, turned: false };
+  hands.push(h);
+
+  ctrl.addEventListener('connected', e => { h.src = e.data; h.handed = e.data.handedness; line.visible = !e.data.hand; });
+  ctrl.addEventListener('disconnected', () => { if (h.held) release(h, false); h.src = null; h.handed = ''; });
+  ctrl.addEventListener('selectstart', () => onTrigger(h));
+  ctrl.addEventListener('squeezestart', () => tryGrab(h));
+  ctrl.addEventListener('squeezeend', () => { if (h.held) release(h, true); });
+}
+
+function rayFrom(h) {
+  tmpM.identity().extractRotation(h.ctrl.matrixWorld);
+  raycaster.ray.origin.setFromMatrixPosition(h.ctrl.matrixWorld);
+  raycaster.ray.direction.set(0, 0, -1).applyMatrix4(tmpM);
+  raycaster.far = 30;
+}
+
+let rayTargets = [];
+function collectRayTargets() {
+  rayTargets = [floor, ...tables, ...targets.filter(t => !t.dead).map(t => t.mesh), ...buttons.map(b => b.mesh), ...grabbables.filter(o => !o.heldBy).map(o => o.mesh)];
+}
+
+function pick() {
+  const hit = raycaster.intersectObjects(rayTargets, false)[0];
+  return hit || null;
+}
+
+function onTrigger(h) {
+  if (h.held) return;
+  const hit = h.hover;
+  if (!hit) return;
+  const u = hit.object.userData;
+  if (u.target) hitTarget(u.target, h.src);
+  else if (u.button) pressButton(u.button, h.src);
+  else if (u.grab) { // 雷射推一下物件
+    rayFrom(h);
+    const d = raycaster.ray.direction;
+    u.grab.body.applyImpulse({ x: d.x * 0.3, y: d.y * 0.3 + 0.1, z: d.z * 0.3 }, true);
+    buzz(h.src, 0.3, 30);
+  }
+}
+
+function tryGrab(h) {
+  if (h.held) return;
+  const gp = tmpV.setFromMatrixPosition(h.grip.matrixWorld);
+  let best = null, bestD = Infinity;
+  for (const o of grabbables) {
+    const d = o.mesh.position.distanceTo(gp) - o.radius;
+    if (d < 0.12 && d < bestD) { best = o; bestD = d; }
+  }
+  let far = false;
+  if (!best && h.hover?.object.userData.grab) { best = h.hover.object.userData.grab; far = true; }
+  if (!best) return;
+  if (best.heldBy) release(best.heldBy, false);  // 從另一隻手搶過來
+
+  h.held = best;
+  best.heldBy = h;
+  best.body.setBodyType(RAPIER.RigidBodyType.KinematicPositionBased, true);
+  if (far) {
+    // 遠距離：飛到手上，抓在手前方一點
+    h.offset.makeTranslation(0, 0, -0.06);
+    h.pull = 0;
+    h.pullFrom = best.mesh.position.clone();
+    h.pullFromQ = best.mesh.quaternion.clone();
+  } else {
+    // 近距離：保持當下相對位置
+    h.offset.copy(h.grip.matrixWorld).invert().multiply(best.mesh.matrixWorld);
+    h.pull = 1;
+  }
+  h.vel.length = 0;
+  h.lastPos.copy(best.mesh.position);
+  buzz(h.src, 0.6, 50);
+  beep(330, 0.05);
+}
+
+function release(h, throwIt) {
+  const o = h.held;
+  if (!o) return;
+  o.body.setBodyType(RAPIER.RigidBodyType.Dynamic, true);
+  if (throwIt && h.vel.length) {
+    const v = new THREE.Vector3();
+    h.vel.forEach(x => v.add(x));
+    v.divideScalar(h.vel.length).multiplyScalar(1.3);
+    o.body.setLinvel({ x: v.x, y: v.y, z: v.z }, true);
+  } else {
+    o.body.setLinvel({ x: 0, y: 0, z: 0 }, true);
+  }
+  o.heldBy = null;
+  h.held = null;
+  buzz(h.src, 0.2, 20);
+}
+
+// ================= Locomotion =================
+const SPEED = 2.2;
+const TURN = THREE.MathUtils.degToRad(30);
+const teleLine = new THREE.Line(new THREE.BufferGeometry().setFromPoints(Array.from({ length: 60 }, () => new THREE.Vector3())), new THREE.LineBasicMaterial({ color: 0x55ccff }));
+teleLine.frustumCulled = false;
+teleLine.visible = false;
+scene.add(teleLine);
+const teleMarker = new THREE.Mesh(new THREE.RingGeometry(0.2, 0.28, 32), new THREE.MeshBasicMaterial({ color: 0x55ccff, side: THREE.DoubleSide }));
+teleMarker.rotation.x = -Math.PI / 2;
+teleMarker.visible = false;
+scene.add(teleMarker);
+let teleValid = false;
+
+function headWorld(out) { return renderer.xr.isPresenting ? out.setFromMatrixPosition(renderer.xr.getCamera().matrixWorld) : camera.getWorldPosition(out); }
+function headYawDir(out) {
+  const cam = renderer.xr.isPresenting ? renderer.xr.getCamera() : camera;
+  cam.getWorldDirection(out); out.y = 0;
+  if (out.lengthSq() < 1e-6) out.set(0, 0, -1);
+  return out.normalize();
+}
+function clampRig() {
+  const lim = ROOM - 0.4;
+  const hp = headWorld(new THREE.Vector3());
+  const dx = THREE.MathUtils.clamp(hp.x, -lim, lim) - hp.x;
+  const dz = THREE.MathUtils.clamp(hp.z, -lim, lim) - hp.z;
+  rig.position.x += dx; rig.position.z += dz;
+}
+function snapTurn(angle) {
+  const hp = headWorld(new THREE.Vector3());
+  rig.position.sub(hp);
+  rig.position.applyAxisAngle(THREE.Object3D.DEFAULT_UP, angle);
+  rig.position.add(hp);
+  rig.rotation.y += angle;
+}
+
+function updateTeleportArc(h) {
+  rayFrom(h);
+  const pts = teleLine.geometry.attributes.position;
+  const p = raycaster.ray.origin.clone();
+  const v = raycaster.ray.direction.clone().multiplyScalar(8);
+  teleValid = false;
+  let n = 0;
+  for (; n < 60; n++) {
+    pts.setXYZ(n, p.x, p.y, p.z);
+    if (p.y <= 0 && n > 0) {
+      p.y = 0;
+      pts.setXYZ(n, p.x, 0, p.z);
+      teleValid = Math.abs(p.x) < ROOM - 0.4 && Math.abs(p.z) < ROOM - 0.4;
+      break;
+    }
+    v.y -= 9.8 * 0.03;
+    p.addScaledVector(v, 0.03);
+  }
+  for (let k = n + 1; k < 60; k++) pts.setXYZ(k, p.x, p.y, p.z);
+  pts.needsUpdate = true;
+  teleLine.visible = true;
+  teleLine.material.color.set(teleValid ? 0x55ccff : 0xff5555);
+  teleMarker.visible = teleValid;
+  teleMarker.position.set(p.x, 0.01, p.z);
+}
+
+function handleSticks(dt) {
+  for (const h of hands) {
+    const gp = h.src?.gamepad;
+    if (!gp) continue;
+    const ax = gp.axes[2] ?? 0, ay = gp.axes[3] ?? 0;
+    if (h.handed === 'left') {
+      if (Math.hypot(ax, ay) > 0.15) {
+        const f = headYawDir(tmpV);
+        const r = tmpV2.crossVectors(f, THREE.Object3D.DEFAULT_UP);
+        rig.position.addScaledVector(f, -ay * SPEED * dt).addScaledVector(r, ax * SPEED * dt);
+        clampRig();
+      }
+    } else if (h.handed === 'right') {
+      // 傳送
+      if (ay < -0.6) { h.aiming = true; updateTeleportArc(h); }
+      else if (h.aiming && Math.abs(ay) < 0.3) {
+        h.aiming = false;
+        teleLine.visible = teleMarker.visible = false;
+        if (teleValid) {
+          const hp = headWorld(new THREE.Vector3());
+          rig.position.x += teleMarker.position.x - hp.x;
+          rig.position.z += teleMarker.position.z - hp.z;
+          buzz(h.src, 0.3, 30);
+        }
+      }
+      // 快速轉向
+      if (!h.aiming) {
+        if (Math.abs(ax) > 0.7 && !h.turned) { snapTurn(ax > 0 ? -TURN : TURN); h.turned = true; }
+        else if (Math.abs(ax) < 0.3) h.turned = false;
+      }
+    }
+    // A / X 按鈕 = 重置
+    const btn = gp.buttons[4]?.pressed;
+    if (btn && !h.btnPrev[4]) resetObjects();
+    h.btnPrev[4] = btn;
+  }
+}
+
+// ================= Wrist HUD =================
+const hc = document.createElement('canvas'); hc.width = 512; hc.height = 256;
+const hx = hc.getContext('2d');
+const htex = new THREE.CanvasTexture(hc); htex.colorSpace = THREE.SRGBColorSpace;
+const hud = new THREE.Mesh(new THREE.PlaneGeometry(0.2, 0.1), new THREE.MeshBasicMaterial({ map: htex, transparent: true, depthTest: false }));
+hud.renderOrder = 10;
+// 桌面時放在場景，VR 時移到左手
+const hudWorldPos = new THREE.Vector3(0, 1.45, 1.3);
+hud.position.copy(hudWorldPos);
+hud.scale.setScalar(4);
+scene.add(hud);
+let score = 0, fps = 0;
+function drawHUD() {
+  hx.clearRect(0, 0, 512, 256);
+  hx.fillStyle = 'rgba(10,20,30,0.85)';
+  hx.beginPath(); hx.roundRect(0, 0, 512, 256, 28); hx.fill();
+  hx.fillStyle = '#fff'; hx.font = 'bold 54px system-ui, sans-serif';
+  hx.fillText(`分數 ${score}`, 28, 80);
+  hx.font = '36px system-ui, sans-serif';
+  hx.fillStyle = fps >= 70 || (!renderer.xr.isPresenting && fps >= 55) ? '#7f7' : '#f77';
+  hx.fillText(`FPS ${fps.toFixed(0)}`, 28, 140);
+  hx.fillStyle = '#bbb';
+  hx.fillText(`物件 ${grabbables.length}　重力 ${world.gravity.y === 0 ? '關' : '開'}`, 28, 200);
+  htex.needsUpdate = true;
+}
+function attachHud() {
+  const left = hands.find(h => h.handed === 'left');
+  if (renderer.xr.isPresenting && left) {
+    if (hud.parent !== left.grip) {
+      left.grip.add(hud);
+      hud.scale.setScalar(1);
+      hud.position.set(0, 0.06, 0.08);
+      hud.rotation.set(-Math.PI / 3, 0, 0);
+    }
+  } else if (hud.parent !== scene) {
+    scene.add(hud);
+    hud.position.copy(hudWorldPos);
+    hud.rotation.set(0, 0, 0);
+    hud.scale.setScalar(4);
+  }
+}
+
+// ================= Desktop fallback =================
+const keys = {};
+addEventListener('keydown', e => keys[e.code] = true);
+addEventListener('keyup', e => keys[e.code] = false);
+let yaw = 0, pitch = 0, dragging = false, dragMoved = false;
+renderer.domElement.addEventListener('pointerdown', () => { dragging = true; dragMoved = false; });
+addEventListener('pointerup', e => {
+  if (dragging && !dragMoved && !renderer.xr.isPresenting) {
+    const ndc = new THREE.Vector2(e.clientX / innerWidth * 2 - 1, -e.clientY / innerHeight * 2 + 1);
+    raycaster.setFromCamera(ndc, camera);
+    collectRayTargets();
+    const hit = pick();
+    const u = hit?.object.userData;
+    if (u?.target) hitTarget(u.target);
+    else if (u?.button) pressButton(u.button);
+    else if (u?.grab) u.grab.body.applyImpulse({ x: raycaster.ray.direction.x * 0.4, y: 0.3, z: raycaster.ray.direction.z * 0.4 }, true);
+  }
+  dragging = false;
+});
+addEventListener('pointermove', e => {
+  if (!dragging || renderer.xr.isPresenting) return;
+  if (Math.abs(e.movementX) + Math.abs(e.movementY) > 1) dragMoved = true;
+  yaw -= e.movementX * 0.004;
+  pitch = THREE.MathUtils.clamp(pitch - e.movementY * 0.004, -1.4, 1.4);
+});
+function desktopMove(dt) {
+  camera.rotation.set(pitch, yaw, 0, 'YXZ');
+  const f = headYawDir(tmpV), r = tmpV2.crossVectors(f, THREE.Object3D.DEFAULT_UP);
+  const mv = (keys.KeyW ? 1 : 0) - (keys.KeyS ? 1 : 0), st = (keys.KeyD ? 1 : 0) - (keys.KeyA ? 1 : 0);
+  rig.position.addScaledVector(f, mv * SPEED * dt).addScaledVector(r, st * SPEED * dt);
+  clampRig();
+}
+renderer.xr.addEventListener('sessionstart', () => { camera.rotation.set(0, 0, 0); });
+
+// ================= Main loop =================
+const clock = new THREE.Clock();
+let fpsFrames = 0, fpsTime = 0, hudTimer = 0;
+
+renderer.setAnimationLoop(() => {
+  const dt = Math.min(clock.getDelta(), 1 / 30);
+  fpsFrames++; fpsTime += dt;
+  if (fpsTime >= 0.5) { fps = fpsFrames / fpsTime; fpsFrames = 0; fpsTime = 0; }
+
+  if (renderer.xr.isPresenting) handleSticks(dt); else desktopMove(dt);
+  scene.updateMatrixWorld();
+
+  // 抓住的物件跟著手
+  for (const h of hands) {
+    const o = h.held;
+    if (!o) continue;
+    tmpM.multiplyMatrices(h.grip.matrixWorld, h.offset);
+    const pos = new THREE.Vector3(), q = new THREE.Quaternion(), s = new THREE.Vector3();
+    tmpM.decompose(pos, q, s);
+    if (h.pull < 1) {
+      h.pull = Math.min(1, h.pull + dt / 0.15);
+      pos.lerpVectors(h.pullFrom, pos, h.pull);
+      q.slerpQuaternions(h.pullFromQ, q, h.pull);
+    }
+    o.body.setNextKinematicTranslation(pos);
+    o.body.setNextKinematicRotation(q);
+    if (dt > 0) {
+      h.vel.push(pos.clone().sub(h.lastPos).divideScalar(dt));
+      if (h.vel.length > 5) h.vel.shift();
+    }
+    h.lastPos.copy(pos);
+  }
+
+  // 物理
+  world.timestep = dt || 1 / 72;
+  world.step();
+  for (const o of grabbables) {
+    const t = o.body.translation(), r = o.body.rotation();
+    o.mesh.position.set(t.x, t.y, t.z);
+    o.mesh.quaternion.set(r.x, r.y, r.z, r.w);
+    if (t.y < -3) { o.body.setTranslation(o.home, true); o.body.setLinvel({ x: 0, y: 0, z: 0 }, true); }
+    // 丟中標靶也算分
+    if (!o.heldBy) {
+      for (const tg of targets) if (!tg.dead && o.mesh.position.distanceTo(tg.mesh.position) < 0.3 + o.radius) hitTarget(tg);
+    }
+  }
+
+  // 標靶動畫
+  const now = clock.elapsedTime;
+  for (const t of targets) {
+    if (t.dead) {
+      t.dead += dt;
+      t.mesh.scale.setScalar(Math.max(0.01, 1 - t.dead * 4));
+      if (t.dead > 1.2) placeTarget(t);
+    } else if (t.moving) {
+      t.mesh.position.x = t.base.x + Math.sin(now * t.speed + t.phase) * 1.5;
+      t.mesh.position.y = t.base.y + Math.sin(now * t.speed * 1.3 + t.phase) * 0.3;
+    }
+  }
+  for (const b of buttons) {
+    b.pressT = Math.max(0, b.pressT - dt);
+    b.mesh.scale.z = b.pressT > 0 ? 0.4 : 1;
+  }
+
+  // 雷射 hover
+  scene.updateMatrixWorld();
+  collectRayTargets();
+  for (const h of hands) {
+    if (!h.src || h.held || h.aiming) { h.line.visible = false; h.dot.visible = false; h.hover = null; continue; }
+    h.line.visible = !h.src.hand;
+    rayFrom(h);
+    const hit = pick();
+    const prev = h.hover?.object;
+    h.hover = hit;
+    if (prev && prev !== hit?.object && prev.userData.grab) prev.material.emissive.setHex(0);
+    if (hit) {
+      h.line.scale.z = hit.distance;
+      h.dot.visible = true;
+      h.dot.position.copy(hit.point);
+      const u = hit.object.userData;
+      const interactive = u.target || u.button || u.grab;
+      rayMat.color.set(interactive ? 0x55ff88 : 0xffffff);
+      if (u.grab) hit.object.material.emissive.setHex(0x333333);
+      if (interactive && prev !== hit.object) buzz(h.src, 0.1, 10);
+    } else {
+      h.line.scale.z = 30;
+      h.dot.visible = false;
+    }
+  }
+
+  attachHud();
+  hudTimer -= dt;
+  if (hudTimer <= 0) { drawHUD(); hudTimer = 0.25; }
+
+  renderer.render(scene, camera);
+});
+</script>
+</body>
+</html>
