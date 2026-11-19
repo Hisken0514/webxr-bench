@@ -1,0 +1,287 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>WebXR 效能測試</title>
+<style>
+  body { margin: 0; background: #111; color: #eee; font-family: system-ui, sans-serif; overflow: hidden; }
+  #ui { position: fixed; top: 0; left: 0; padding: 12px 16px; background: rgba(0,0,0,.7); font-size: 14px; max-width: 380px; line-height: 1.7; }
+  #ui label { display: inline-block; min-width: 92px; }
+  #ui select, #ui input, #ui button { font-size: 14px; }
+  #stats { margin-top: 8px; font-family: ui-monospace, monospace; white-space: pre; }
+  #hint { margin-top: 8px; color: #aaa; font-size: 12px; }
+</style>
+<script type="importmap">
+{ "imports": {
+  "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+  "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"
+} }
+</script>
+</head>
+<body>
+<div id="ui">
+  <div><label>模式</label><select id="mode">
+    <option value="instanced">Instanced（1 個 draw call，測 GPU）</option>
+    <option value="separate">各自獨立（N 個 draw call，測 CPU）</option>
+  </select></div>
+  <div><label>物件數</label><input id="count" type="number" min="10" step="100" style="width:100px"></div>
+  <div><label>模型精細度</label><select id="detail">
+    <option value="0">20 面</option><option value="1">80 面</option>
+    <option value="2">320 面</option><option value="3">1280 面</option>
+  </select></div>
+  <div><label>材質</label><select id="mat">
+    <option value="basic">Unlit（最輕）</option>
+    <option value="lambert">Lambert（Simple Lit）</option>
+    <option value="standard">Standard（PBR）</option>
+  </select></div>
+  <div><label>更新率</label><select id="hz">
+    <option>72</option><option>90</option><option>120</option>
+  </select></div>
+  <div><label>解析度倍率</label><select id="fbs">
+    <option value="0.8">0.8</option><option value="1" selected>1.0</option><option value="1.2">1.2</option>
+  </select></div>
+  <div><label>注視點渲染</label><select id="fov">
+    <option value="0">關</option><option value="0.5">中</option><option value="1" selected>高</option>
+  </select></div>
+  <div><label>旋轉動畫</label><input id="anim" type="checkbox" checked></div>
+  <div><button id="auto">自動測試上限</button></div>
+  <div id="stats"></div>
+  <div id="hint">
+    VR 中操作：右扳機 = 物件 ×1.5｜左扳機 = 物件 ÷1.5<br>
+    右握把 = 自動測試｜左握把 = 切換模式
+  </div>
+</div>
+
+<script type="module">
+import * as THREE from 'three';
+import { VRButton } from 'three/addons/webxr/VRButton.js';
+
+const $ = id => document.getElementById(id);
+
+// ---------- Renderer / scene ----------
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.setSize(innerWidth, innerHeight);
+renderer.xr.enabled = true;
+document.body.appendChild(renderer.domElement);
+document.body.appendChild(VRButton.createButton(renderer));
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x202028);
+const camera = new THREE.PerspectiveCamera(70, innerWidth / innerHeight, 0.05, 100);
+camera.position.set(0, 1.6, 0);
+scene.add(new THREE.HemisphereLight(0xffffff, 0x444455, 1.2));
+const sun = new THREE.DirectionalLight(0xffffff, 1.5);
+sun.position.set(2, 5, 1);
+scene.add(sun);
+
+addEventListener('resize', () => {
+  camera.aspect = innerWidth / innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+});
+
+// ---------- State ----------
+const state = { count: 1000, mode: 'instanced', detail: 1, mat: 'lambert', hz: 72, fbs: 1, fov: 1, anim: true };
+const MAX = { instanced: 2000000, separate: 200000 };
+let group = null, trisPerObj = 0;
+
+const rand = n => { const x = Math.sin(n * 12.9898) * 43758.5453; return x - Math.floor(x); };
+const tmp = new THREE.Object3D();
+const col = new THREE.Color();
+
+function makeMaterial() {
+  if (state.mat === 'basic') return new THREE.MeshBasicMaterial({ color: 0xffffff });
+  if (state.mat === 'standard') return new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.5, metalness: 0.2 });
+  return new THREE.MeshLambertMaterial({ color: 0xffffff });
+}
+
+function place(i, obj) {
+  const r = 3 + rand(i * 3) * 9;
+  const a = rand(i * 3 + 1) * Math.PI * 2;
+  obj.position.set(Math.cos(a) * r, 0.2 + rand(i * 3 + 2) * 4, Math.sin(a) * r);
+  obj.rotation.set(i, i * 0.5, 0);
+}
+
+function build() {
+  state.count = Math.max(10, Math.min(MAX[state.mode], Math.round(state.count)));
+  if (group) {
+    scene.remove(group);
+    group.traverse(o => { o.geometry?.dispose(); o.material?.dispose(); if (o.isInstancedMesh) o.dispose(); });
+  }
+  group = new THREE.Group();
+  const geo = new THREE.IcosahedronGeometry(0.15, state.detail);
+  const mat = makeMaterial();
+  trisPerObj = (geo.index ? geo.index.count : geo.attributes.position.count) / 3;
+  const n = state.count;
+
+  if (state.mode === 'instanced') {
+    const m = new THREE.InstancedMesh(geo, mat, n);
+    for (let i = 0; i < n; i++) {
+      place(i, tmp); tmp.updateMatrix();
+      m.setMatrixAt(i, tmp.matrix);
+      m.setColorAt(i, col.setHSL(rand(i), 0.6, 0.55));
+    }
+    m.frustumCulled = false;
+    group.add(m);
+  } else {
+    const mats = Array.from({ length: 8 }, (_, k) => { const mm = mat.clone(); mm.color.setHSL(k / 8, 0.6, 0.55); return mm; });
+    mat.dispose();
+    for (let i = 0; i < n; i++) {
+      const mesh = new THREE.Mesh(geo, mats[i % 8]);
+      place(i, mesh);
+      mesh.matrixAutoUpdate = false;
+      mesh.updateMatrix();
+      group.add(mesh);
+    }
+  }
+  scene.add(group);
+  syncUI();
+}
+
+// ---------- In-VR HUD ----------
+const hc = document.createElement('canvas');
+hc.width = 1024; hc.height = 560;
+const hx = hc.getContext('2d');
+const htex = new THREE.CanvasTexture(hc);
+htex.colorSpace = THREE.SRGBColorSpace;
+const hud = new THREE.Mesh(new THREE.PlaneGeometry(1.1, 0.6), new THREE.MeshBasicMaterial({ map: htex, transparent: true }));
+hud.position.set(0, 1.25, -1.2);
+hud.rotation.x = -0.3;
+scene.add(hud);
+
+// ---------- Stats ----------
+let frames = 0, winStart = 0, last = 0, worstMs = 0, worstWin = 0, fps = 0;
+let calls = 0, tris = 0;
+let resultText = '尚未測試';
+const auto = { on: false, best: 0, warm: 0 };
+
+function targetHz() {
+  const s = renderer.xr.getSession();
+  return (s && s.frameRate) || (renderer.xr.isPresenting ? 72 : 60);
+}
+
+function statLines() {
+  const t = targetHz();
+  return [
+    `FPS: ${fps.toFixed(1)} / ${t}${renderer.xr.isPresenting ? ' (VR)' : ' (桌面)'}`,
+    `最慢一幀: ${worstWin.toFixed(1)} ms（預算 ${(1000 / t).toFixed(1)} ms）`,
+    `模式: ${state.mode === 'instanced' ? 'Instanced' : '各自獨立'}`,
+    `物件數: ${state.count.toLocaleString()}`,
+    `Draw calls: ${calls.toLocaleString()}`,
+    `三角面/幀: ${tris.toLocaleString()}`,
+    auto.on ? `自動測試中… 目前通過 ${auto.best.toLocaleString()}` : `結果: ${resultText}`,
+  ];
+}
+
+function drawHUD() {
+  const lines = statLines();
+  hx.clearRect(0, 0, hc.width, hc.height);
+  hx.fillStyle = 'rgba(0,0,0,0.75)';
+  hx.beginPath(); hx.roundRect(0, 0, hc.width, hc.height, 32); hx.fill();
+  hx.font = 'bold 44px system-ui, sans-serif';
+  const ok = fps >= targetHz() * 0.95;
+  lines.forEach((l, i) => {
+    hx.fillStyle = i === 0 ? (ok ? '#6f6' : '#f66') : '#fff';
+    hx.fillText(l, 36, 72 + i * 70);
+  });
+  htex.needsUpdate = true;
+  $('stats').textContent = lines.join('\n');
+}
+
+function onSecond() {
+  if (auto.on) {
+    auto.warm++;
+    if (auto.warm >= 3) { // 跳過前 2 秒（建場景的卡頓），用第 3 秒判斷
+      if (fps >= targetHz() * 0.95 && state.count < MAX[state.mode]) {
+        auto.best = state.count;
+        state.count *= 1.5;
+        auto.warm = 0;
+        build();
+      } else {
+        if (fps >= targetHz() * 0.95) auto.best = state.count;
+        auto.on = false;
+        resultText = `${state.mode === 'instanced' ? 'Instanced' : '獨立'} 上限約 ${auto.best.toLocaleString()} 個（${(auto.best * trisPerObj).toLocaleString()} 面）`;
+        state.count = auto.best || 10;
+        build();
+      }
+    }
+  }
+  drawHUD();
+}
+
+function startAuto() {
+  auto.on = true; auto.best = 0; auto.warm = 0;
+  state.count = 100;
+  build();
+}
+
+renderer.setAnimationLoop(t => {
+  const dt = last ? t - last : 16;
+  last = t;
+  frames++;
+  if (dt > worstMs) worstMs = dt;
+  if (!winStart) winStart = t;
+  if (t - winStart >= 1000) {
+    fps = frames * 1000 / (t - winStart);
+    worstWin = worstMs;
+    frames = 0; worstMs = 0; winStart = t;
+    onSecond();
+  }
+  if (state.anim && group) group.rotation.y += dt * 0.00005;
+  renderer.render(scene, camera);
+  calls = renderer.info.render.calls;
+  tris = renderer.info.render.triangles;
+});
+
+// ---------- XR session settings ----------
+renderer.xr.addEventListener('sessionstart', () => {
+  const s = renderer.xr.getSession();
+  renderer.xr.setFoveation(state.fov);
+  if (s.updateTargetFrameRate && s.supportedFrameRates?.includes(state.hz)) {
+    s.updateTargetFrameRate(state.hz).catch(() => {});
+  }
+});
+
+for (let i = 0; i < 2; i++) {
+  const c = renderer.xr.getController(i);
+  scene.add(c);
+  c.addEventListener('connected', e => { c.userData.hand = e.data.handedness; });
+  c.addEventListener('selectstart', () => {
+    if (auto.on) return;
+    state.count *= c.userData.hand === 'left' ? 1 / 1.5 : 1.5;
+    build();
+  });
+  c.addEventListener('squeezestart', () => {
+    if (c.userData.hand === 'left') {
+      auto.on = false;
+      state.mode = state.mode === 'instanced' ? 'separate' : 'instanced';
+      build();
+    } else startAuto();
+  });
+}
+
+// ---------- DOM UI ----------
+function syncUI() {
+  $('mode').value = state.mode;
+  $('count').value = state.count;
+  $('detail').value = state.detail;
+  $('mat').value = state.mat;
+  $('hz').value = state.hz;
+  $('anim').checked = state.anim;
+}
+$('mode').onchange = e => { state.mode = e.target.value; build(); };
+$('count').onchange = e => { state.count = +e.target.value; build(); };
+$('detail').onchange = e => { state.detail = +e.target.value; build(); };
+$('mat').onchange = e => { state.mat = e.target.value; build(); };
+$('hz').onchange = e => { state.hz = +e.target.value; };
+$('fbs').onchange = e => { state.fbs = +e.target.value; if (!renderer.xr.isPresenting) renderer.xr.setFramebufferScaleFactor(state.fbs); };
+$('fov').onchange = e => { state.fov = +e.target.value; renderer.xr.setFoveation(state.fov); };
+$('anim').onchange = e => { state.anim = e.target.checked; };
+$('auto').onclick = startAuto;
+
+build();
+</script>
+</body>
+</html>
